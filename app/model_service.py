@@ -5,6 +5,10 @@ import os
 import subprocess
 import tempfile
 import uuid
+import wave
+from contextlib import contextmanager
+from contextvars import ContextVar
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -16,10 +20,80 @@ except ImportError:
 from funasr import AutoModel
 
 import config
-from leader_store import LeaderStore, cosine_similarity
+from leader_store import LeaderStore
 
 
 logger = logging.getLogger(__name__)
+
+
+_active_pcm_reader: ContextVar = ContextVar("asr_pcm_reader", default=None)
+
+
+class _PCMClipReader:
+    """Reuse a normalized PCM WAV handle; preserve individual clip samples."""
+
+    def __init__(self, path: str) -> None:
+        self.path = os.path.abspath(path)
+        self.reader = wave.open(path, "rb")
+        if (self.reader.getnchannels(), self.reader.getsampwidth(),
+                self.reader.getframerate(), self.reader.getcomptype()) != (1, 2, 16000, "NONE"):
+            self.reader.close()
+            raise ValueError("PCM fast path requires normalized 16 kHz mono s16 WAV")
+
+    def extract(self, start: float, duration: float) -> str:
+        rate = self.reader.getframerate()
+        self.reader.setpos(min(round(start * rate), self.reader.getnframes()))
+        frames = self.reader.readframes(round(duration * rate))
+        path = str(Path(tempfile.gettempdir()) / f"leader_clip_{uuid.uuid4().hex}.wav")
+        try:
+            with wave.open(path, "wb") as output:
+                output.setnchannels(1)
+                output.setsampwidth(2)
+                output.setframerate(rate)
+                output.writeframes(frames)
+            return path
+        except BaseException:
+            Path(path).unlink(missing_ok=True)
+            raise
+
+
+@contextmanager
+def _reuse_pcm_clips(path: str):
+    try:
+        reader = _PCMClipReader(path)
+    except (OSError, ValueError, wave.Error):
+        # Keep the original ffmpeg path for unnormalized or unsupported inputs.
+        yield
+        return
+    token = _active_pcm_reader.set(reader)
+    try:
+        yield
+    finally:
+        _active_pcm_reader.reset(token)
+        reader.reader.close()
+
+
+class _SpeakerFeaturePool:
+    """Run the installed Kaldi feature function unchanged for each clip."""
+
+    def __init__(self, original, workers: int) -> None:
+        self.original = original
+        self.pad_list = original.__globals__["pad_list"]
+        self.executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="asr-spk-feat")
+
+    def _one(self, audio):
+        return self.original([audio])
+
+    def __call__(self, audio):
+        if len(audio) < 2:
+            return self.original(audio)
+        # map preserves the original clip order, including variable-length tails.
+        results = list(self.executor.map(self._one, audio))
+        features = self.pad_list([result[0][0] for result in results], pad_value=0)
+        return features, [result[1][0] for result in results], [result[2][0] for result in results]
+
+    def close(self) -> None:
+        self.executor.shutdown(wait=True)
 
 
 def detect_device() -> str:
@@ -62,39 +136,38 @@ class FunASRService:
         if str(self.device).startswith("npu"):
             import torch
             import torch_npu  # noqa: F401
-
             if not hasattr(torch, "npu"):
-                raise RuntimeError("torch_npu was imported but torch.npu is unavailable")
-            device_count = torch.npu.device_count()
-            if device_count < 1:
-                raise RuntimeError("no Ascend NPU is visible to the ASR process")
-            logger.info("Ascend NPU backend is ready: devices=%s", device_count)
+                raise RuntimeError("NPU backend is not registered after importing torch_npu")
+            if torch.npu.device_count() < 1:
+                raise RuntimeError("No Ascend NPU device is visible to torch_npu")
+
         self.model = AutoModel(
             model=config.ASR_MODEL,
             vad_model=config.VAD_MODEL,
             punc_model=config.PUNC_MODEL,
             spk_model=config.SPK_MODEL,
             device=self.device,
+            ncpu=getattr(config, "ASR_CPU_THREADS", 4),
             disable_update=True,
         )
+        workers = getattr(config, "SPK_FEATURE_WORKERS", 1)
+        speaker = getattr(self.model, "spk_model", None)
+        inference = getattr(speaker, "inference", None)
+        namespace = getattr(inference, "__globals__", {})
+        extractor = namespace.get("extract_feature")
+        if workers > 1 and callable(extractor) and not isinstance(extractor, _SpeakerFeaturePool):
+            namespace["extract_feature"] = _SpeakerFeaturePool(extractor, workers)
+            logger.info("Speaker CPU features use %s independent workers", workers)
         logger.info("FunASR models are ready")
 
-    def transcribe(
-        self,
-        audio_path: str,
-        num_speakers: int | None = None,
-        hotwords: str | None = None,
-    ) -> list[dict[str, Any]]:
+    def transcribe(self, audio_path: str, num_speakers: int | None = None) -> list[dict[str, Any]]:
         self._ensure_loaded()
         kwargs: dict[str, Any] = {
             "input": audio_path,
             "batch_size_s": config.BATCH_SIZE_S,
         }
-        selected_hotwords = config.ASR_HOTWORDS if hotwords is None else hotwords.strip()
-        if selected_hotwords:
-            kwargs["hotword"] = selected_hotwords
         if num_speakers and num_speakers > 0:
-            kwargs["preset_spk_num"] = num_speakers
+            kwargs["spk_kwargs"] = {"num_speakers": num_speakers}
 
         raw_results = self.model.generate(**kwargs)
         full_text: list[str] = []
@@ -116,7 +189,7 @@ class FunASRService:
                     }
                 )
 
-        return self._refine_speaker_labels(audio_path, segments, num_speakers)
+        return segments
 
     def extract_voiceprint(self, audio_path: str) -> list[float]:
         self._ensure_loaded()
@@ -140,27 +213,20 @@ class FunASRService:
         if not leader_store.has_samples():
             return segments
 
-        segment_scores: dict[int, list[dict[str, Any]]] = {}
-        for index, segment in enumerate(segments):
-            scores = self._score_segment(audio_path, segment, leader_store)
-            segment_scores[index] = scores
-            if return_scores:
-                segment["leader_candidates"] = scores
+        with _reuse_pcm_clips(audio_path):
+            segment_scores: dict[int, list[dict[str, Any]]] = {}
+            for index, segment in enumerate(segments):
+                scores = self._score_segment(audio_path, segment, leader_store)
+                segment_scores[index] = scores
+                if return_scores:
+                    segment["leader_candidates"] = scores
 
-        speaker_matches = self._identify_speakers(
-            audio_path,
-            segments,
-            leader_store,
-            segment_scores,
-            threshold,
-        )
-        for segment in segments:
-            match = speaker_matches.get(segment["speaker"])
-            if match:
-                self._mark_leader(segment, match)
-        if config.LEADER_MERGE_MATCHED_SPEAKERS:
-            self._merge_matched_leader_speakers(segments, speaker_matches)
-        return segments
+            speaker_matches = self._identify_speakers(audio_path, segments, leader_store, segment_scores)
+            for segment in segments:
+                match = speaker_matches.get(segment["speaker"])
+                if match:
+                    self._mark_leader(segment, match)
+            return segments
 
     def _identify_speakers(
         self,
@@ -168,7 +234,6 @@ class FunASRService:
         segments: list[dict[str, Any]],
         leader_store: LeaderStore,
         segment_scores: dict[int, list[dict[str, Any]]],
-        threshold: float,
     ) -> dict[str, dict[str, Any]]:
         speaker_segments: dict[str, list[tuple[int, dict[str, Any]]]] = {}
         for index, segment in enumerate(segments):
@@ -195,13 +260,8 @@ class FunASRService:
                         "segment_top_avg": segment_evidence.get(leader_id, {}).get("top_avg"),
                         "support_segments": segment_evidence.get(leader_id, {}).get("support", 0),
                         "speaker_margin": round(score["score"] - next_leader_score, 5),
-                        "speaker_rank": next(
-                            index
-                            for index, item in enumerate(speaker_scores)
-                            if item["leader_id"] == leader_id
-                        ),
                     }
-                    if self._candidate_has_evidence(candidate, threshold):
+                    if self._candidate_has_evidence(candidate):
                         leader_candidates.setdefault(leader_id, []).append(candidate)
             finally:
                 try:
@@ -209,36 +269,27 @@ class FunASRService:
                 except OSError:
                     pass
 
-        return self._select_leader_matches(leader_candidates)
-
-    def _select_leader_matches(
-        self,
-        leader_candidates: dict[str, list[dict[str, Any]]],
-    ) -> dict[str, dict[str, Any]]:
-        candidates = [
-            candidate
-            for leader_items in leader_candidates.values()
-            for candidate in leader_items
-        ]
-        candidates.sort(
-            key=lambda item: (
-                item["score"],
-                item["speaker_score"],
-                item["support_segments"],
-            ),
-            reverse=True,
-        )
-
+        assigned_speakers: set[str] = set()
         matches: dict[str, dict[str, Any]] = {}
-        for candidate in candidates:
+        winners: list[dict[str, Any]] = []
+        for _, candidates in leader_candidates.items():
+            candidates.sort(key=lambda item: item["score"], reverse=True)
+            best = candidates[0]
+            runner_up = candidates[1]["score"] if len(candidates) > 1 else -1.0
+            best["meeting_margin"] = round(best["score"] - runner_up, 5)
+            if self._candidate_wins_meeting(best, runner_up):
+                winners.append(best)
+
+        for candidate in sorted(winners, key=lambda item: item["score"], reverse=True):
             speaker = candidate["speaker"]
-            if speaker in matches:
+            if speaker in assigned_speakers:
                 continue
             matches[speaker] = {
                 "leader_id": candidate["leader_id"],
                 "score": candidate["score"],
                 "confidence": self._confidence_label(candidate),
             }
+            assigned_speakers.add(speaker)
         return matches
 
     def _speaker_segment_evidence(
@@ -290,41 +341,24 @@ class FunASRService:
                 return score["score"]
         return -1.0
 
-    def _candidate_has_evidence(self, candidate: dict[str, Any], threshold: float) -> bool:
-        if candidate["score"] >= threshold:
-            if candidate["speaker_score"] >= 0.50:
-                return True
-            if candidate["speaker_margin"] < config.LEADER_SCORE_MARGIN:
-                return False
-            if candidate["speaker_score"] >= config.LEADER_SPEAKER_THRESHOLD:
-                return True
-            if candidate["support_segments"] >= 2 and candidate["score"] >= config.LEADER_SEGMENT_THRESHOLD:
-                return True
-
-        if (
-            candidate["speaker_rank"] != 0
-            or candidate["speaker_score"] < config.LEADER_RELATIVE_MIN_SCORE
-        ):
+    def _candidate_has_evidence(self, candidate: dict[str, Any]) -> bool:
+        if candidate["speaker_score"] >= 0.50:
+            return True
+        if candidate["speaker_margin"] < config.LEADER_SCORE_MARGIN:
             return False
-
-        if (
-            candidate["speaker_margin"] >= config.LEADER_RELATIVE_MARGIN
-            and candidate["support_segments"] >= config.LEADER_RELATIVE_SUPPORT_SEGMENTS
-        ):
+        if candidate["speaker_score"] >= config.LEADER_SPEAKER_THRESHOLD:
             return True
-
-        if (
-            candidate["speaker_score"] >= config.LEADER_SPEAKER_THRESHOLD
-            and candidate["speaker_margin"] >= config.LEADER_RELATIVE_MARGIN
-            and candidate["support_segments"] >= config.LEADER_SHORT_SUPPORT_SEGMENTS
-        ):
+        if candidate["support_segments"] >= 2 and candidate["score"] >= config.LEADER_SEGMENT_THRESHOLD:
             return True
+        return False
 
-        return (
-            candidate["score"] >= config.LEADER_STRONG_SUPPORT_MIN_SCORE
-            and candidate["speaker_margin"] >= config.LEADER_STRONG_SUPPORT_MARGIN
-            and candidate["support_segments"] >= config.LEADER_STRONG_SUPPORT_SEGMENTS
-        )
+    def _candidate_wins_meeting(self, candidate: dict[str, Any], runner_up: float) -> bool:
+        if runner_up < 0:
+            return True
+        adaptive_gap = max(config.LEADER_SCORE_MARGIN, min(0.12, candidate["score"] * 0.18))
+        if candidate["score"] - runner_up >= adaptive_gap:
+            return True
+        return candidate["support_segments"] >= 2 and candidate["score"] - runner_up >= config.LEADER_SCORE_MARGIN
 
     @staticmethod
     def _confidence_label(candidate: dict[str, Any]) -> str:
@@ -338,39 +372,12 @@ class FunASRService:
         segment["is_leader"] = True
         segment["leader_id"] = match["leader_id"]
 
-    @staticmethod
-    def _merge_matched_leader_speakers(
-        segments: list[dict[str, Any]],
-        speaker_matches: dict[str, dict[str, Any]],
-    ) -> None:
-        speakers_by_leader: dict[str, list[str]] = {}
-        for speaker, match in speaker_matches.items():
-            speakers_by_leader.setdefault(match["leader_id"], []).append(speaker)
-
-        aliases: dict[str, str] = {}
-        for speakers in speakers_by_leader.values():
-            if len(speakers) < 2:
-                continue
-            canonical = max(
-                speakers,
-                key=lambda speaker: speaker_matches[speaker]["score"],
-            )
-            for speaker in speakers:
-                aliases[speaker] = canonical
-
-        if not aliases:
-            return
-
-        roots_in_order: list[str] = []
-        for segment in segments:
-            speaker = aliases.get(segment["speaker"], segment["speaker"])
-            if speaker not in roots_in_order:
-                roots_in_order.append(speaker)
-            segment["speaker"] = str(roots_in_order.index(speaker))
-
     def _extract_clip(self, audio_path: str, start: float, end: float) -> str:
         start = max(0.0, start - config.SEGMENT_PADDING_MS / 1000.0)
         duration = max(0.2, end - start + config.SEGMENT_PADDING_MS / 1000.0)
+        reader = _active_pcm_reader.get()
+        if reader is not None and reader.path == os.path.abspath(audio_path):
+            return reader.extract(start, duration)
         out_path = str(Path(tempfile.gettempdir()) / f"leader_clip_{uuid.uuid4().hex}.wav")
         cmd = [
             "ffmpeg",
@@ -436,214 +443,6 @@ class FunASRService:
             except OSError:
                 pass
 
-    def _refine_speaker_labels(
-        self,
-        audio_path: str,
-        segments: list[dict[str, Any]],
-        target_count: int | None,
-    ) -> list[dict[str, Any]]:
-        groups: dict[str, list[dict[str, Any]]] = {}
-        for segment in segments:
-            if segment["end_time"] - segment["start_time"] >= config.LEADER_MIN_SEGMENT_SECONDS:
-                groups.setdefault(segment["speaker"], []).append(segment)
-        if len(groups) < 2:
-            return segments
-
-        profiles: dict[str, dict[str, Any]] = {}
-        for speaker, items in groups.items():
-            combined_path = self._extract_speaker_audio(audio_path, items)
-            try:
-                profiles[speaker] = {
-                    "embedding": self.extract_voiceprint(combined_path),
-                    "duration": sum(item["end_time"] - item["start_time"] for item in items),
-                }
-            finally:
-                try:
-                    os.remove(combined_path)
-                except OSError:
-                    pass
-
-        aliases = {speaker: speaker for speaker in groups}
-        if target_count and target_count > 0:
-            while len({self._speaker_root(aliases, speaker) for speaker in groups}) > target_count:
-                pair = self._most_similar_active_speakers(profiles, aliases)
-                if pair is None:
-                    break
-                left, right, score = pair
-                self._merge_speaker_profiles(left, right, profiles, aliases)
-                logger.info(
-                    "Merged speaker %s into %s to satisfy requested count, similarity=%.5f",
-                    left,
-                    right,
-                    score,
-                )
-        else:
-            total_duration = sum(profile["duration"] for profile in profiles.values())
-            for speaker in sorted(profiles, key=lambda item: profiles[item]["duration"]):
-                if self._speaker_root(aliases, speaker) != speaker:
-                    continue
-                duration = profiles[speaker]["duration"]
-                is_minor = (
-                    duration <= config.SPEAKER_AUTO_MERGE_MAX_SECONDS
-                    or duration / max(total_duration, 0.001) <= config.SPEAKER_AUTO_MERGE_MAX_RATIO
-                )
-                if not is_minor:
-                    continue
-                candidates = []
-                for other in profiles:
-                    if other == speaker or self._speaker_root(aliases, other) != other:
-                        continue
-                    score = cosine_similarity(
-                        profiles[speaker]["embedding"],
-                        profiles[other]["embedding"],
-                    )
-                    candidates.append((score, other))
-                candidates.sort(reverse=True)
-                if not candidates:
-                    continue
-                best_score, best_speaker = candidates[0]
-                runner_up = candidates[1][0] if len(candidates) > 1 else -1.0
-                if (
-                    best_score >= config.SPEAKER_AUTO_MERGE_THRESHOLD
-                    and best_score - runner_up >= config.SPEAKER_AUTO_MERGE_MARGIN
-                ):
-                    self._merge_speaker_profiles(speaker, best_speaker, profiles, aliases)
-                    logger.info(
-                        "Auto-merged minor speaker %s into %s, similarity=%.5f, margin=%.5f",
-                        speaker,
-                        best_speaker,
-                        best_score,
-                        best_score - runner_up,
-                    )
-
-        for segment in segments:
-            segment["speaker"] = self._speaker_root(aliases, segment["speaker"])
-        self._smooth_short_speaker_switches(audio_path, segments, profiles)
-
-        roots_in_order: list[str] = []
-        for segment in segments:
-            root = segment["speaker"]
-            if root not in roots_in_order:
-                roots_in_order.append(root)
-            segment["speaker"] = str(roots_in_order.index(root))
-        return segments
-
-    def _smooth_short_speaker_switches(
-        self,
-        audio_path: str,
-        segments: list[dict[str, Any]],
-        profiles: dict[str, dict[str, Any]],
-    ) -> None:
-        for index in range(1, len(segments) - 1):
-            previous = segments[index - 1]
-            current = segments[index]
-            following = segments[index + 1]
-            neighbor_speaker = previous["speaker"]
-            current_speaker = current["speaker"]
-            if neighbor_speaker != following["speaker"] or current_speaker == neighbor_speaker:
-                continue
-
-            duration = current["end_time"] - current["start_time"]
-            previous_gap = max(0.0, current["start_time"] - previous["end_time"])
-            following_gap = max(0.0, following["start_time"] - current["end_time"])
-            if (
-                duration < config.LEADER_MIN_SEGMENT_SECONDS
-                or duration > config.SPEAKER_JITTER_MAX_SECONDS
-                or previous_gap > config.SPEAKER_JITTER_MAX_GAP_SECONDS
-                or following_gap > config.SPEAKER_JITTER_MAX_GAP_SECONDS
-                or neighbor_speaker not in profiles
-                or current_speaker not in profiles
-            ):
-                continue
-
-            clip_path = self._extract_clip(audio_path, current["start_time"], current["end_time"])
-            try:
-                try:
-                    embedding = self.extract_voiceprint(clip_path)
-                    neighbor_score = cosine_similarity(
-                        embedding,
-                        profiles[neighbor_speaker]["embedding"],
-                    )
-                    current_score = cosine_similarity(
-                        embedding,
-                        profiles[current_speaker]["embedding"],
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Could not score short speaker switch at %.2f-%.2f: %s",
-                        current["start_time"],
-                        current["end_time"],
-                        exc,
-                    )
-                    continue
-            finally:
-                try:
-                    os.remove(clip_path)
-                except OSError:
-                    pass
-
-            if (
-                neighbor_score >= config.SPEAKER_JITTER_MIN_SIMILARITY
-                and neighbor_score - current_score >= config.SPEAKER_JITTER_MARGIN
-            ):
-                current["speaker"] = neighbor_speaker
-                logger.info(
-                    "Smoothed short speaker switch %s into %s at %.2f-%.2f, "
-                    "similarity=%.5f, margin=%.5f",
-                    current_speaker,
-                    neighbor_speaker,
-                    current["start_time"],
-                    current["end_time"],
-                    neighbor_score,
-                    neighbor_score - current_score,
-                )
-
-    @staticmethod
-    def _speaker_root(aliases: dict[str, str], speaker: str) -> str:
-        while aliases[speaker] != speaker:
-            aliases[speaker] = aliases[aliases[speaker]]
-            speaker = aliases[speaker]
-        return speaker
-
-    def _most_similar_active_speakers(
-        self,
-        profiles: dict[str, dict[str, Any]],
-        aliases: dict[str, str],
-    ) -> tuple[str, str, float] | None:
-        active = [speaker for speaker in profiles if self._speaker_root(aliases, speaker) == speaker]
-        best: tuple[str, str, float] | None = None
-        for index, left in enumerate(active):
-            for right in active[index + 1 :]:
-                score = cosine_similarity(
-                    profiles[left]["embedding"],
-                    profiles[right]["embedding"],
-                )
-                if best is None or score > best[2]:
-                    best = (left, right, score)
-        return best
-
-    @staticmethod
-    def _merge_speaker_profiles(
-        source: str,
-        target: str,
-        profiles: dict[str, dict[str, Any]],
-        aliases: dict[str, str],
-    ) -> None:
-        if profiles[source]["duration"] > profiles[target]["duration"]:
-            source, target = target, source
-        source_duration = profiles[source]["duration"]
-        target_duration = profiles[target]["duration"]
-        total_duration = source_duration + target_duration
-        profiles[target]["embedding"] = [
-            (left * target_duration + right * source_duration) / total_duration
-            for left, right in zip(
-                profiles[target]["embedding"],
-                profiles[source]["embedding"],
-            )
-        ]
-        profiles[target]["duration"] = total_duration
-        aliases[source] = target
-
     def _ensure_loaded(self) -> None:
         if self.model is None:
             raise RuntimeError("model is not loaded")
@@ -652,22 +451,13 @@ class FunASRService:
     def _merge_adjacent_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
         merged: list[dict[str, Any]] = []
         for segment in segments:
-            gap = (
-                max(0.0, segment["start_time"] - merged[-1]["end_time"])
-                if merged
-                else 0.0
-            )
             if (
                 merged
                 and merged[-1]["speaker"] == segment["speaker"]
                 and FunASRService._leader_id(merged[-1]) == FunASRService._leader_id(segment)
-                and gap <= config.SEGMENT_MERGE_MAX_GAP_SECONDS
             ):
-                merged[-1]["text"] = FunASRService._join_segment_text(
-                    merged[-1].get("text", ""),
-                    segment.get("text", ""),
-                )
-                merged[-1]["end_time"] = max(merged[-1]["end_time"], segment["end_time"])
+                merged[-1]["text"] += segment["text"]
+                merged[-1]["end_time"] = segment["end_time"]
                 merged[-1]["is_leader"] = merged[-1].get("is_leader", False) or segment.get("is_leader", False)
                 if segment.get("leader_id"):
                     merged[-1]["leader_id"] = segment["leader_id"]
@@ -677,20 +467,6 @@ class FunASRService:
                 segment.pop("leader", None)
                 merged.append(segment)
         return merged
-
-    @staticmethod
-    def _join_segment_text(left: str, right: str) -> str:
-        if not left:
-            return right
-        if not right:
-            return left
-        needs_space = (
-            left[-1].isascii()
-            and right[0].isascii()
-            and left[-1].isalnum()
-            and right[0].isalnum()
-        )
-        return f"{left} {right}" if needs_space else f"{left}{right}"
 
     @staticmethod
     def _leader_id(segment: dict[str, Any]) -> str | None:
